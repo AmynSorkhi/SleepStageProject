@@ -239,8 +239,8 @@ def test_model(model, data_loader, win_len, win_stride, device):
 # 5. Main: Prepare DataLoaders, Model, and Run     #
 ###################################################
 if __name__ == '__main__':
-    data_folder = '/path/to/train_folder'
-    test_folder = '/path/to/test_folder'
+    data_folder = "/home/amyn/projects/def-montazn/amyn/SleepStageProject/mesa/features_smoothed_all_reduced_manualr"
+    test_folder = "/home/amyn/projects/def-montazn/amyn/SleepStageProject/mesa/test_smoothed_all_reduced_manual"
     save_dir = './results'
     os.makedirs(save_dir, exist_ok=True)
 
