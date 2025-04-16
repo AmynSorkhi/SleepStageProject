@@ -12,127 +12,92 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 #################################################################
-# 1. Dataset Creation (Per-file sequences, no sleep-efficiency)  #
+# 1. Dataset Creation (Global Scaling, per-file sequences)      #
 #################################################################
 class SleepDataset(Dataset):
-    """
-    Loads each CSV file as a sequence of epochs (features + label).
-    Returns: (features_tensor [num_epochs, feat_dim], labels_tensor [num_epochs])
-    """
     def __init__(self, folder_path, train_file_count=None):
-        self.data = []  # list of (features, labels) per file
-        # Gather CSV paths
+        self.features = []
+        self.labels = []
         all_paths = sorted([
             os.path.join(folder_path, f)
-            for f in os.listdir(folder_path)
-            if f.endswith('.csv')
+            for f in os.listdir(folder_path) if f.endswith('.csv')
         ])
-        if train_file_count is not None:
+        if train_file_count:
             all_paths = all_paths[:train_file_count]
         if not all_paths:
-            raise ValueError(f"No CSV files found in {folder_path}")
-
-        # --- Global scaling fit ---
-        all_feats = []
-        for path in all_paths:
-            df = pd.read_csv(path)
-            feats = df.iloc[:, :-1].values
-            all_feats.append(feats)
+            raise ValueError(f"No CSV files in {folder_path}")
+        # fit scaler on all
+        all_feats = [pd.read_csv(p).iloc[:, :-1].values for p in all_paths]
         all_feats = np.vstack(all_feats)
         self.scaler = StandardScaler().fit(all_feats)
-
-        # --- Load, remap labels, scale, and store each file ---
-        for path in all_paths:
-            df = pd.read_csv(path)
+        # load each
+        for p in all_paths:
+            df = pd.read_csv(p)
             feats = df.iloc[:, :-1].values
-            labels = df.iloc[:, -1].values
-            # Remap: 0→0, 1–4→1, 5→2, others→-1
-            labels = np.where(labels == 0, 0,
-                      np.where(np.isin(labels, [1,2,3,4]), 1,
-                      np.where(labels == 5, 2, -1)))
-            # filter out unknowns
-            mask = labels != -1
-            feats = feats[mask]
-            labels = labels[mask]
+            labs = df.iloc[:, -1].values
+            labs = np.where(labs==0, 0,
+                   np.where(np.isin(labs,[1,2,3,4]),1,
+                   np.where(labs==5,2,-1)))
+            mask = labs!=-1
+            feats = feats[mask]; labs = labs[mask]
             feats = self.scaler.transform(feats)
-            # to tensors
-            feats_t = torch.tensor(feats, dtype=torch.float32)
-            labels_t = torch.tensor(labels, dtype=torch.long)
-            self.data.append((feats_t, labels_t))
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx]
+            self.features.append(torch.tensor(feats, dtype=torch.float32))
+            self.labels.append(torch.tensor(labs, dtype=torch.long))
+    def __len__(self): return len(self.features)
+    def __getitem__(self, idx): return self.features[idx], self.labels[idx]
 
 ##########################################
-# 2. Model Definition (CNN per-epoch → sliding windows → LSTM) #
+# 2. Model Definition (CNN → window → LSTM) #
 ##########################################
-class SleepModel(nn.Module):
-    def __init__(self, feat_dim, lstm_hidden=256, dropout=0.5,
-                 win_len=12, win_stride=1):
-        super(SleepModel, self).__init__()
+class SleepModelMultiBranch(nn.Module):
+    def __init__(self, total_input_size, lstm_hidden_size=256, dropout_rate=0.5, win_len=12):
+        super().__init__()
         self.win_len = win_len
-        self.win_stride = win_stride
-        # CNN branches (pointwise conv across features)
-        # Actigraphy: first 8 dims
-        self.acti_conv = nn.Sequential(
-            nn.Conv1d(in_channels=8, out_channels=32, kernel_size=1),
-            nn.ReLU(), nn.Dropout(dropout),
-            nn.Conv1d(32, 64, kernel_size=1),
-            nn.ReLU(), nn.Dropout(dropout)
-        )
-        # Heart rate: next 8 dims
-        self.hr_conv = nn.Sequential(
-            nn.Conv1d(8, 32, kernel_size=1),
-            nn.ReLU(), nn.Dropout(dropout),
-            nn.Conv1d(32, 64, kernel_size=1),
-            nn.ReLU(), nn.Dropout(dropout)
-        )
-        # Fusion
-        self.layer_norm = nn.LayerNorm(128)
-        self.fusion = nn.Sequential(
-            nn.Linear(128, 128),
-            nn.ReLU()
-        )
-        # LSTM + classifier
-        self.lstm = nn.LSTM(input_size=128, hidden_size=lstm_hidden,
-                            batch_first=True)
-        self.classifier = nn.Linear(lstm_hidden, 3)
-        self.dropout = nn.Dropout(dropout)
+        # CNN: same as original
+        self.acti_conv1 = nn.Conv1d(8,32,kernel_size=9,stride=1,padding=4)
+        self.acti_conv2 = nn.Conv1d(32,64,kernel_size=9,stride=1,padding=4)
+        self.acti_conv3 = nn.Conv1d(64,64,kernel_size=9,stride=1,padding=4)
+        self.hr_conv1   = nn.Conv1d(8,32,kernel_size=9,stride=1,padding=4)
+        self.hr_conv2   = nn.Conv1d(32,64,kernel_size=9,stride=1,padding=4)
+        self.hr_conv3   = nn.Conv1d(64,64,kernel_size=9,stride=1,padding=4)
+        self.dropout    = nn.Dropout(dropout_rate)
+        self.combined_ln = nn.LayerNorm(128)
+        self.fusion_linear = nn.Linear(128,128)
+        self.fusion_activation = nn.ReLU()
+        self.lstm       = nn.LSTM(input_size=128, hidden_size=lstm_hidden_size, batch_first=True)
+        self.fc         = nn.Linear(lstm_hidden_size,3)
 
     def forward(self, x):
-        # x: (B, T, feat_dim)
+        # x: (B, T, D)
         B, T, D = x.shape
-        # split branches
-        acti = x[:, :, :8]  # (B, T, 8)
-        hr   = x[:, :, 8:16]
-        # reshape for conv1d: (B, C, T)
-        acti = acti.permute(0, 2, 1)
-        hr   = hr.permute(0, 2, 1)
-        # CNN per epoch (pointwise)
-        acti_feat = self.acti_conv(acti).permute(0, 2, 1)  # (B, T, 64)
-        hr_feat   = self.hr_conv(hr).permute(0, 2, 1)      # (B, T, 64)
-        # combine
-        combined = torch.cat([acti_feat, hr_feat], dim=2)  # (B, T, 128)
-        combined = self.layer_norm(combined)
-        combined = self.fusion(combined)                   # (B, T, 128)
-        # sliding windows along time
-        # windows: (B, num_wins, win_len, 128)
-        wins = combined.unfold(dimension=1,
-                               size=self.win_len,
-                               step=self.win_stride)
-        B, num_wins, win_len, C = wins.shape
-        # reshape for LSTM: (B*num_wins, win_len, 128)
-        wins = wins.contiguous().view(-1, win_len, C)
+        # split features
+        acti = x[:,:,:8].permute(0,2,1)  # (B,8,T)
+        hr   = x[:,:,8:16].permute(0,2,1)
+        # CNN
+        acti = self.dropout(torch.relu(self.acti_conv1(acti)))
+        acti = self.dropout(torch.relu(self.acti_conv2(acti)))
+        acti = self.dropout(torch.relu(self.acti_conv3(acti)))
+        acti = acti.permute(0,2,1)       # (B,T,64)
+        hr   = self.dropout(torch.relu(self.hr_conv1(hr)))
+        hr   = self.dropout(torch.relu(self.hr_conv2(hr)))
+        hr   = self.dropout(torch.relu(self.hr_conv3(hr)))
+        hr   = hr.permute(0,2,1)         # (B,T,64)
+        # fuse
+        combined = torch.cat([acti, hr], dim=2)  # (B,T,128)
+        combined = self.combined_ln(combined)
+        combined = self.fusion_activation(self.fusion_linear(combined))
+        # sliding windows
+        wins = combined.unfold(1, self.win_len, 1)  # (B, num_wins, win_len, 128)
+        B2, num_wins, wlen, C = wins.shape
+        wins = wins.contiguous().view(-1, wlen, C)   # (B*num_wins, win_len, 128)
+        # compact LSTM weights
+        self.lstm.flatten_parameters()
         # LSTM
         lstm_out, (h_n, _) = self.lstm(wins)
-        h_last = h_n[-1]  # (B*num_wins, hidden)
-        h_last = self.dropout(h_last)
-        logits = self.classifier(h_last)  # (B*num_wins, 3)
-        # reshape back: (B, num_wins, 3)
-        return logits.view(B, num_wins, -1)
+        h_last = h_n[-1]
+        out = self.dropout(h_last)
+        logits = self.fc(out)                      # (B*num_wins, 3)
+        return logits.view(B, num_wins, -1)        # (B, num_wins, 3)
 
 ################################################
 # 3. Training Function (handles windowed output) #
