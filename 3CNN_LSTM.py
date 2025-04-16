@@ -236,7 +236,7 @@ if __name__ == '__main__':
 
     # model
     feat_dim = train_ds[0][0].shape[1]
-    model = SleepModel(feat_dim, lstm_hidden, dropout, win_len, win_stride)
+    model = SleepModelMultiBranch(feat_dim, lstm_hidden, dropout, win_len, win_stride)
 
     # train
     train_model(model, train_loader, val_loader,
